@@ -671,3 +671,46 @@ func TestGobEncoding(t *testing.T) {
 		t.Errorf("gob decoded item does not match original")
 	}
 }
+
+func TestCache_ProgressiveSlidingTTL(t *testing.T) {
+	c := cache.NewCache(&cache.CacheConfig{})
+
+	key := "test_key"
+	value := "test_value"
+	initialTTL := 500 * time.Millisecond // Use milliseconds for faster test
+
+	// Add item with sliding TTL
+	c.Set(key, value, initialTTL)
+
+	// Get item & verify TTL increased
+	time.Sleep(200 * time.Millisecond) // Small delay
+	_, exists := c.Get(key)
+	if !exists {
+		t.Fatalf("expected item to exist after first access")
+	}
+
+	item, _ := c.InspectItem(key) // Use helper to get the raw item
+
+	// Verify the TTL doubled (from 500ms → 1s)
+	expectedTTL := initialTTL * 2
+	if item.SlidingTTL != expectedTTL {
+		t.Errorf("expected SlidingTTL to be %v, got %v", expectedTTL, item.SlidingTTL)
+	}
+
+	// Access again, should double TTL to 2s
+	time.Sleep(200 * time.Millisecond)
+	c.Get(key)
+
+	expectedTTL = initialTTL * 4 // Now should be 2s
+	if item.SlidingTTL != expectedTTL {
+		t.Errorf("expected SlidingTTL to be %v, got %v", expectedTTL, item.SlidingTTL)
+	}
+
+	// Check expiration logic: Wait longer than current TTL
+	time.Sleep(expectedTTL + 100*time.Millisecond)
+	_, exists = c.Get(key)
+	if exists {
+		t.Fatalf("expected item to expire, but it still exists")
+	}
+}
+

@@ -173,8 +173,35 @@ func (c *Cache) Get(key string) (interface{}, bool) {
 		return nil, false
 	}
 
+	// Update LastAccessed timestamp
+	item.LastAccessed = time.Now()
+	if item.SlidingTTL > 0 {
+		newTTL := item.SlidingTTL * 2 // Double the TTL
+		maxTTL := item.TTL * 10       // Limit max TTL to 10x initial TTL
+
+		if newTTL > maxTTL {
+			newTTL = maxTTL // Don't let it grow indefinitely
+		}
+
+		item.SlidingTTL = newTTL
+		item.Expiration = time.Now().Add(newTTL)
+	}
+
 	c.eviction.MoveToFront(elem)
 	return item.Value, true
+}
+
+// Get retrieves a value from the cache
+func (c *Cache) InspectItem(key string) (*CacheItem, bool) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	element, exists := c.items[key]
+	if !exists {
+		return nil, false
+	}
+
+	return element.Value.(*CacheItem), true
 }
 
 // Set adds a key-value pair to the cache
@@ -187,6 +214,14 @@ func (c *Cache) Set(key string, value interface{}, ttl ...time.Duration) {
 		expiration = time.Now().Add(ttl[0]) // Use provided TTL if given
 	}
 
+	var slidingTTL time.Duration
+	if len(ttl) > 0 {
+		expiration = time.Now().Add(ttl[0])
+		slidingTTL = ttl[0] // Store for sliding TTL logic
+	} else {
+		slidingTTL = defaultTTL // Default sliding TTL if none provided
+	}
+
 	// If key already exists, update and move to front
 	if elem, found := c.items[key]; found {
 		item, ok := elem.Value.(*CacheItem)
@@ -196,6 +231,8 @@ func (c *Cache) Set(key string, value interface{}, ttl ...time.Duration) {
 		}
 		item.Value = value
 		item.Expiration = expiration
+		item.LastAccessed = time.Now()
+		item.SlidingTTL = slidingTTL
 		c.eviction.MoveToFront(elem)
 		return
 	}
@@ -209,7 +246,10 @@ func (c *Cache) Set(key string, value interface{}, ttl ...time.Duration) {
 	item := &CacheItem{
 		Key:        key,
 		Value:      value,
-		Expiration: expiration}
+		Expiration: expiration,
+		SlidingTTL: slidingTTL,
+		TTL: slidingTTL,
+	}
 	elem := c.eviction.PushFront(item)
 	c.items[key] = elem
 }

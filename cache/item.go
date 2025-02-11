@@ -8,9 +8,12 @@ import (
 
 // CacheItem represents an individual cache entry
 type CacheItem struct {
-	Key        string
-	Value      interface{}
-	Expiration time.Time
+	Key          string
+	Value        interface{}
+	Expiration   time.Time
+	LastAccessed time.Time // New field for metadata
+	TTL          time.Duration
+	SlidingTTL   time.Duration
 }
 
 // Register CacheItem for gob encoding
@@ -28,9 +31,12 @@ func NewCacheItem(key string, value interface{}, ttl time.Duration) *CacheItem {
 	}
 
 	return &CacheItem{
-		Key:        key,
-		Value:      value,
-		Expiration: expiration,
+		Key:          key,
+		Value:        value,
+		Expiration:   expiration,
+		LastAccessed: time.Now(),
+		TTL:          ttl,
+		SlidingTTL:   ttl,
 	}
 }
 
