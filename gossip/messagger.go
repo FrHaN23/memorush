@@ -107,12 +107,21 @@ func (n *Node) sendIndirectPing(suspectID, intermediaryAddr string) {
 }
 
 func (n *Node) serializePeers() map[string]string {
-	peers := make(map[string]string)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// Ensure map is not nil
+	if n.Peers == nil {
+		return make(map[string]string) // Return empty map instead of nil
+	}
+
+	peers := make(map[string]string, len(n.Peers)) // Pre-allocate space
 	for id, peer := range n.Peers {
 		peers[id] = peer.Address
 	}
 	return peers
 }
+
 
 func (n *Node) indirectProbe(suspectID string) {
 	successCount := 0
