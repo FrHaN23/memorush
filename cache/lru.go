@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"time"
+	"maps"
 )
 
 // Default values
@@ -191,6 +192,18 @@ func (c *Cache) Get(key string) (interface{}, bool) {
 	return item.Value, true
 }
 
+func (c *Cache) GetItems() map[string]*list.Element {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	// Return a copy to avoid race conditions
+	copiedItems := make(map[string]*list.Element, len(c.items))
+	maps.Copy(copiedItems, c.items)
+
+	return copiedItems
+}
+
+
 // Get retrieves a value from the cache
 func (c *Cache) InspectItem(key string) (*CacheItem, bool) {
 	c.mutex.Lock()
@@ -200,8 +213,14 @@ func (c *Cache) InspectItem(key string) (*CacheItem, bool) {
 	if !exists {
 		return nil, false
 	}
-
-	return element.Value.(*CacheItem), true
+	
+	//type assert
+	item, ok := element.Value.(*CacheItem)
+	if !ok {
+		log.Printf("Type assertion failed for key: %s", key)
+		return nil, false
+	}
+	return item, true
 }
 
 // Set adds a key-value pair to the cache
@@ -266,9 +285,14 @@ func (c *Cache) Delete(key string) {
 
 // evict removes the least recently used item
 func (c *Cache) evict() {
-	elem := c.eviction.Back()
-	if elem != nil {
-		c.removeElement(elem)
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if back := c.eviction.Back(); back != nil {
+		item := back.Value.(*CacheItem)
+		delete(c.items, item.Key)
+		c.eviction.Remove(back)
+		log.Printf("Evicted cache item: %s", item.Key)
 	}
 }
 

@@ -1,12 +1,17 @@
 package gossip
 
 import (
+	"bytes"
+	"encoding/gob"
 	"encoding/json"
 	"log"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/frhan23/memorush/cache"
+	"golang.org/x/time/rate"
 )
 
 // NodeStatus represents the state of a node.
@@ -20,12 +25,14 @@ const (
 
 // Node represents a single cache node in the gossip network.
 type Node struct {
-	ID       string
-	Address  string
-	Peers    map[string]*PeerInfo // Known peers
-	mu       sync.RWMutex
-	listener *net.UDPConn
-	shutdown uint32
+	ID        string
+	Address   string
+	Peers     map[string]*PeerInfo // Known peers
+	mu        sync.RWMutex
+	listener  *net.UDPConn
+	shutdown  uint32
+	rateLimit *RateLimiter
+	Cache     *cache.Cache
 }
 
 // PeerInfo stores details about a known peer.
@@ -36,13 +43,36 @@ type PeerInfo struct {
 	LastAck time.Time
 }
 
+type RateLimiter struct {
+	mu       sync.Mutex
+	limiters map[string]*rate.Limiter
+}
+
+func NewRateLimiter() *RateLimiter {
+	return &RateLimiter{
+		limiters: make(map[string]*rate.Limiter),
+	}
+}
+
 // NewNode initializes a new gossip node.
 func NewNode(id, address string) *Node {
-	return &Node{
-		ID:      id,
-		Address: address,
-		Peers:   make(map[string]*PeerInfo),
+	node := &Node{
+		ID:        id,
+		Address:   address,
+		Peers:     make(map[string]*PeerInfo),
+		rateLimit: NewRateLimiter(),
+		Cache:     cache.NewCache(&cache.CacheConfig{}),
 	}
+
+	// Start peer discovery
+	go node.ListenForPeers()
+	go node.BroadcastPresence()
+
+	go node.ListenCacheUpdates()
+
+	go node.cleanupDeadPeers()
+
+	return node
 }
 
 func (n *Node) handleGossip(data []byte, remoteAddr *net.UDPAddr) {
@@ -74,15 +104,16 @@ func (n *Node) handleGossip(data []byte, remoteAddr *net.UDPAddr) {
 		peer.LastAck = time.Now() // Update last known time
 	}
 
-	// Process additional peers in the message
-	for id, addr := range msg.Peers {
-		if id == n.ID || id == senderID {
-			continue // Ignore self and sender
+	// Process cache updates
+	for key, item := range msg.CacheData {
+		n.mu.Lock()
+		localItem, found := n.Cache.InspectItem(key)
+
+		if !found || item.LastAccessed.After(localItem.LastAccessed) {
+			n.Cache.Set(key, item)
+			log.Printf("Updated cache: %s -> %v", key, item.Value)
 		}
-		if _, found := n.Peers[id]; !found {
-			n.Peers[id] = &PeerInfo{Address: addr, Status: Alive, LastAck: time.Now()}
-			log.Printf("Learned about peer: %s -> %s\n", id, addr)
-		}
+		n.mu.Unlock()
 	}
 }
 
@@ -102,4 +133,100 @@ func (n *Node) Shutdown() {
 		n.listener.Close() // Close the UDP socket
 	}
 	log.Printf("%s: Node shutdown complete.", n.ID)
+}
+
+func (n *Node) cleanupDeadPeers() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		n.mu.Lock()
+		for id, peer := range n.Peers {
+			if peer.Status == Dead && time.Since(peer.LastAck) > 2*time.Minute {
+				delete(n.Peers, id)
+				log.Printf("Removed dead peer: %s", id)
+			}
+		}
+		n.mu.Unlock()
+	}
+}
+
+func (n *Node) SyncCacheWithPeers() {
+	for {
+		time.Sleep(time.Second * 10) // Adjust interval as needed
+
+		n.mu.Lock()
+		cacheSnapshot := make(map[string]*cache.CacheItem)
+
+		for key, elem := range n.Cache.GetItems() {
+			item := elem.Value.(*cache.CacheItem)
+			cacheSnapshot[key] = item
+		}
+		n.mu.Unlock()
+
+		for _, peer := range n.Peers {
+			go n.SendCacheUpdate(peer, cacheSnapshot)
+		}
+	}
+}
+
+func (n *Node) SendCacheUpdate(peer *PeerInfo, cacheSnapshot map[string]*cache.CacheItem) {
+	// Serialize cacheSnapshot to send over UDP
+	data, err := serializeCacheSnapshot(cacheSnapshot)
+	if err != nil {
+		log.Printf("Failed to serialize cache snapshot: %v", err)
+		return
+	}
+
+	addr, err := net.ResolveUDPAddr("udp", peer.Address)
+	if err != nil {
+		log.Printf("Failed to resolve peer address %s: %v", peer.Address, err)
+		return
+	}
+
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		log.Printf("Failed to send cache update to %s: %v", peer.Address, err)
+		return
+	}
+	defer conn.Close()
+
+	_, err = conn.Write(data)
+	if err != nil {
+		log.Printf("Failed to write to peer %s: %v", peer.Address, err)
+	}
+}
+
+func (rl *RateLimiter) Allow(peer string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	limiter, exists := rl.limiters[peer]
+	if !exists {
+		limiter = rate.NewLimiter(rate.Every(5*time.Second), 1) // Allow 1 request per 5 seconds
+		rl.limiters[peer] = limiter
+	}
+
+	return !limiter.Allow()
+}
+
+func serializeCacheSnapshot(snapshot map[string]*cache.CacheItem) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	err := enc.Encode(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func deserializeCacheSnapshot(data []byte) (map[string]*cache.CacheItem, error) {
+	buf := bytes.NewBuffer(data)
+	dec := gob.NewDecoder(buf)
+	var snapshot map[string]*cache.CacheItem
+	err := dec.Decode(&snapshot)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot, nil
 }

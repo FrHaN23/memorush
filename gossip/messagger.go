@@ -9,16 +9,18 @@ import (
 	"net"
 	"time"
 
+	"github.com/frhan23/memorush/cache"
 	"golang.org/x/time/rate"
 )
 
 type GossipMessage struct {
-	Type      string            `json:"type"`
-	SenderID  string            `json:"sender_id"`
-	SenderIP  string            `json:"sender_ip"`
-	Peers     map[string]string `json:"peers"`
-	TargetID  string            `json:"target_id,omitempty"`
-	Signature string            `json:"signature"`
+	Type      string                `json:"type"`
+	SenderID  string                `json:"sender_id"`
+	SenderIP  string                `json:"sender_ip"`
+	Peers     map[string]string     `json:"peers"`
+	TargetID  string                `json:"target_id,omitempty"`
+	Signature string                `json:"signature"`
+	CacheData map[string]cache.CacheItem `json:"cache_data,omitempty"`
 }
 
 var secretKey = []byte("your-secure-key")
@@ -72,10 +74,11 @@ func (n *Node) sendPing(peerAddr string) {
 }
 
 func (n *Node) sendToPeer(peerAddr string, data []byte) {
-	if !limiter.Allow() {
-		log.Println("Rate limit exceeded, skipping message")
+	if n.rateLimit.Allow(peerAddr) {
+		log.Printf("Rate limit exceeded for peer %s, skipping message\n", peerAddr)
 		return
 	}
+
 	conn, err := net.Dial("udp", peerAddr)
 	if err != nil {
 		log.Println("Failed to send to peer:", err)
@@ -122,7 +125,6 @@ func (n *Node) serializePeers() map[string]string {
 	return peers
 }
 
-
 func (n *Node) indirectProbe(suspectID string) {
 	successCount := 0
 
@@ -151,5 +153,28 @@ func (n *Node) indirectProbe(suspectID string) {
 		n.Peers[suspectID].Status = Dead
 		n.mu.Unlock()
 		log.Printf("Peer %s is now marked as Dead\n", suspectID)
+	}
+}
+
+func (n *Node) ProcessCacheUpdate(data []byte, addr *net.UDPAddr) {
+	cacheSnapshot, err := deserializeCacheSnapshot(data)
+	if err != nil {
+		log.Printf("Failed to deserialize cache update: %v", err)
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	for key, item := range cacheSnapshot {
+		localItem, found := n.Cache.InspectItem(key)
+		
+		// Update if:
+		// - Key doesn't exist locally OR
+		// - The received item has a more recent LastAccessed time
+		if !found || item.LastAccessed.After(localItem.LastAccessed) {
+			n.Cache.Set(key, item.Value, item.TTL)
+			log.Printf("Updated cache from peer: %s -> %v", key, item.Value)
+		}
 	}
 }

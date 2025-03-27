@@ -3,6 +3,7 @@ package gossip
 import (
 	"encoding/json"
 	"log"
+	"math"
 	"math/rand"
 	"net"
 	"sync/atomic"
@@ -29,9 +30,9 @@ func (n *Node) StartListening() {
 			log.Printf("%s: Listener shutting down...", n.ID)
 			return
 		}
-		
+
 		conn.SetReadDeadline(time.Now().Add(1 * time.Second)) // Prevents indefinite blocking
-		
+
 		nRead, remoteAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			log.Printf("Read error: %v", err)
@@ -45,10 +46,11 @@ func (n *Node) StartListening() {
 		// Log received raw message
 		log.Printf("Received from %s: %s", remoteAddr.String(), string(data))
 
-		// Handle the gossip message in a separate goroutine
-		go n.handleGossip(data, remoteAddr)
+		// Handle discovery messages
+		go n.handleDiscoveryMessage(data, remoteAddr)
 	}
 }
+
 
 func (n *Node) SendGossip() {
 	for {
@@ -64,13 +66,15 @@ func (n *Node) SendGossip() {
 			continue
 		}
 
+		targetCount := max(int(math.Sqrt(float64(peerCount))), 1)
+
 		// Pick a random peer
 		var peerList []*PeerInfo
 		for _, peer := range n.Peers {
 			peerList = append(peerList, peer)
 		}
 		rand.Shuffle(len(peerList), func(i, j int) { peerList[i], peerList[j] = peerList[j], peerList[i] })
-		targetPeer := peerList[0] // Pick the first after shuffle
+		selectedPeers := peerList[:targetCount]
 		n.mu.Unlock()
 
 		// Send gossip message
@@ -84,7 +88,35 @@ func (n *Node) SendGossip() {
 			log.Println("Failed to encode PING:", err)
 			return
 		}
-		log.Printf("Sending gossip: %s\n", string(data))
-		n.sendToPeer(targetPeer.Address, data)
+		log.Printf("Sending gossip to %d peers\n", targetCount)
+		for _, peer := range selectedPeers {
+			go n.sendToPeer(peer.Address, data) // Send in a goroutine for concurrency
+		}
+	}
+}
+
+func (n *Node) ListenCacheUpdates() {
+	addr, err := net.ResolveUDPAddr("udp", n.Address)
+	if err != nil {
+		log.Fatalf("Failed to resolve address %s: %v", n.Address, err)
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		log.Fatalf("Failed to listen on %s: %v", n.Address, err)
+	}
+	defer conn.Close()
+
+	log.Printf("Listening for cache updates on %s", n.Address)
+
+	buf := make([]byte, 4096) // Buffer for incoming data
+	for {
+		nRead, remoteAddr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			log.Printf("Error reading UDP message: %v", err)
+			continue
+		}
+
+		go n.ProcessCacheUpdate(buf[:nRead], remoteAddr)
 	}
 }
